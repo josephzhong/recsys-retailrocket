@@ -9,7 +9,7 @@ The dataset is well suited to recommendation work because it contains implicit-f
 According to the Kaggle dataset page, the data is organized into three main parts:
 
 - `events.csv`: user behavior events collected over about 4.5 months
-- `item_properties.csv`: time-dependent item attributes such as category and availability, with property changes represented over time
+- `item_properties.csv`: time-dependent item attributes such as category and availability, with property changes represented over time. These are files are the largest and most challenging ones to handle.
 - `category_tree.csv`: the product category hierarchy
 
 The Kaggle page also describes the dataset as containing:
@@ -19,7 +19,7 @@ The Kaggle page also describes the dataset as containing:
 - 69,332 add-to-cart events
 - 22,457 transactions
 - 1,407,580 unique visitors
-- item properties for 417,053 unique items
+- item properties for more than 20,000,000 values and 400,000 unique items
 
 The raw values are hashed for confidentiality, while some fields such as `categoryid` and `available` remain interpretable. This makes the dataset realistic for recommender-system experimentation while still protecting sensitive business information.
 

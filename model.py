@@ -8,7 +8,6 @@ from pathlib import Path
 
 import torch
 from torch import Tensor, nn
-from tqdm import tqdm
 
 
 PAD_TOKEN_ID = 0
@@ -36,10 +35,18 @@ class CategoryPropertyRecord:
 
 
 @dataclass(frozen=True)
+class UserEventHistory:
+    item_id: int
+    bucket_id: int
+    count: int
+
+
+@dataclass(frozen=True)
 class ItemEmbeddingResources:
     numeric_properties_by_item: dict[int, tuple[NumericPropertyRecord, ...]]
     non_numeric_properties_by_item: dict[int, tuple[NonNumericPropertyRecord, ...]]
     category_properties_by_item: dict[int, tuple[CategoryPropertyRecord, ...]]
+    user_histories_by_visitor: dict[int, dict[str, tuple[UserEventHistory, ...]]]
     numeric_vector_size: int
     category_vector_size: int
     category_ancestors_by_id: dict[int, tuple[int, ...]]
@@ -58,7 +65,7 @@ class ItemEmbeddingModelState:
     resources: ItemEmbeddingResources
     token_transformer: "DecoderOnlyPropertyTransformer"
     item_projection: nn.Linear
-    precomputed_non_numeric_token_embeddings: Tensor
+    user_projection: nn.Linear
     device: torch.device
 
 
@@ -94,18 +101,22 @@ class AttentionOnlyEncoderLayer(nn.Module):
     def forward(
         self,
         x: Tensor,
+        key_value: Tensor | None = None,
         attn_mask: Tensor | None = None,
         key_padding_mask: Tensor | None = None,
     ) -> Tensor:
+        query = x
+        key = x if key_value is None else key_value
+        value = key
         attn_output, _ = self.self_attn(
-            x,
-            x,
-            x,
+            query,
+            key,
+            value,
             attn_mask=attn_mask,
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )
-        return self.norm(x + self.dropout(attn_output))
+        return self.norm(query + self.dropout(attn_output))
 
 
 class DecoderOnlyPropertyTransformer(nn.Module):
@@ -116,7 +127,6 @@ class DecoderOnlyPropertyTransformer(nn.Module):
         vocab_size: int,
         d_model: int = 32,
         nhead: int = 4,
-        dim_feedforward: int = 64,
         dropout: float = 0.0,
         max_len: int = 128,
     ) -> None:
@@ -130,37 +140,119 @@ class DecoderOnlyPropertyTransformer(nn.Module):
             nhead=nhead,
             dropout=dropout,
         )
-        self.dim_feedforward = dim_feedforward
 
     def forward(self, token_ids: Tensor) -> Tensor:
         if token_ids.ndim != 2:
             raise ValueError("token_ids must have shape [batch_size, sequence_length].")
 
-        # Maps token IDs [batch_size, sequence_length] to hidden states
-        # [batch_size, sequence_length, d_model] with causal self-attention.
+        # Left-padded token IDs [batch_size, sequence_length] are mapped directly
+        # to one latent vector per sequence with shape [batch_size, d_model].
         token_ids = token_ids[:, : self.max_len]
         embeddings = self.token_embedding(token_ids) * math.sqrt(self.d_model)
         embeddings = self.positional_encoding(embeddings)
 
-        seq_len = token_ids.size(1)
-        causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), float("-inf"), device=token_ids.device),
-            diagonal=1,
-        )
         padding_mask = token_ids.eq(PAD_TOKEN_ID)
+        query = embeddings[:, -1:, :]
 
-        return self.attention_layer(
-            embeddings,
-            attn_mask=causal_mask,
+        latent_embedding = self.attention_layer(
+            query,
+            key_value=embeddings,
             key_padding_mask=padding_mask,
         )
+        return latent_embedding.squeeze(1)
 
     def get_next_token_latent_embedding(self, token_ids: Tensor) -> Tensor:
         # Returns one latent vector per sequence with shape [batch_size, d_model].
-        hidden_states = self.forward(token_ids)
-        valid_lengths = token_ids.ne(PAD_TOKEN_ID).sum(dim=1).clamp(min=1)
-        batch_indices = torch.arange(token_ids.size(0), device=token_ids.device)
-        return hidden_states[batch_indices, valid_lengths - 1]
+        return self.forward(token_ids)
+
+
+class FactorizationMachines(nn.Module):
+    """Binary FM classifier over concatenated user and item embeddings."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        latent_dim: int = 16,
+    ) -> None:
+        super().__init__()
+        if embedding_dim <= 0:
+            raise ValueError("embedding_dim must be greater than 0.")
+        if latent_dim <= 0:
+            raise ValueError("latent_dim must be greater than 0.")
+
+        self.embedding_dim = embedding_dim
+        self.input_dim = embedding_dim * 2
+        self.latent_dim = latent_dim
+        self.linear = nn.Linear(self.input_dim, 1)
+        self.factor_embeddings = nn.Parameter(
+            torch.empty(self.input_dim, latent_dim, dtype=torch.float32)
+        )
+        self.loss_fn = nn.BCEWithLogitsLoss()
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+        nn.init.xavier_uniform_(self.factor_embeddings)
+
+    def _concatenate_features(
+        self,
+        user_embeddings: Tensor,
+        item_embeddings: Tensor,
+    ) -> Tensor:
+        if user_embeddings.ndim != 2 or item_embeddings.ndim != 2:
+            raise ValueError("user_embeddings and item_embeddings must both have shape [batch_size, embedding_dim].")
+        if user_embeddings.shape != item_embeddings.shape:
+            raise ValueError("user_embeddings and item_embeddings must have matching shapes.")
+        if user_embeddings.size(1) != self.embedding_dim:
+            raise ValueError(
+                f"Expected embedding dimension {self.embedding_dim}, got {user_embeddings.size(1)}."
+            )
+        return torch.cat((user_embeddings, item_embeddings), dim=1)
+
+    def forward(
+        self,
+        user_embeddings: Tensor,
+        item_embeddings: Tensor,
+    ) -> Tensor:
+        features = self._concatenate_features(
+            user_embeddings=user_embeddings,
+            item_embeddings=item_embeddings,
+        )
+        linear_term = self.linear(features).squeeze(-1)
+        projected_features = features @ self.factor_embeddings
+        projected_squared = projected_features.square()
+        squared_projected = features.square() @ self.factor_embeddings.square()
+        pairwise_term = 0.5 * (projected_squared - squared_projected).sum(dim=1)
+        return linear_term + pairwise_term
+
+    def predict_proba(
+        self,
+        user_embeddings: Tensor,
+        item_embeddings: Tensor,
+    ) -> Tensor:
+        return torch.sigmoid(self.forward(user_embeddings, item_embeddings))
+
+    def compute_loss(
+        self,
+        user_embeddings: Tensor,
+        item_embeddings: Tensor,
+        labels: Tensor,
+    ) -> Tensor:
+        logits = self.forward(user_embeddings, item_embeddings)
+        labels = labels.to(device=logits.device, dtype=logits.dtype).reshape(-1)
+        if labels.shape != logits.shape:
+            raise ValueError("labels must have shape [batch_size].")
+        return self.loss_fn(logits, labels)
+
+    def forward_batch(
+        self,
+        batch: tuple[Tensor, Tensor, Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        user_embeddings, item_embeddings, labels = batch
+        logits = self.forward(user_embeddings, item_embeddings)
+        loss = self.compute_loss(user_embeddings, item_embeddings, labels)
+        return logits, loss
 
 def _resolve_dataset_dir(dataset_path: str | Path | None = None) -> Path:
     if dataset_path is None:
@@ -180,6 +272,41 @@ def _parse_bucket_history(history: str) -> dict[int, str]:
         bucket_str, value = bucket_value.split("|", maxsplit=1)
         parsed[int(bucket_str)] = value
     return parsed
+
+
+def _parse_user_event_history(
+    history: str,
+    item_id_by_original_id: dict[int, int],
+) -> tuple[UserEventHistory, ...]:
+    parsed_histories: list[UserEventHistory] = []
+    if not history:
+        return ()
+
+    for raw_entry in history.split("+"):
+        if not raw_entry:
+            continue
+        original_item_id_str, bucket_str, count_str = raw_entry.split("|", maxsplit=2)
+        mapped_item_id = item_id_by_original_id.get(int(original_item_id_str))
+        if mapped_item_id is None:
+            continue
+
+        bucket_id = int(bucket_str)
+        if bucket_id < 0 or bucket_id >= 6:
+            continue
+
+        count = int(count_str)
+        if count <= 0:
+            continue
+
+        parsed_histories.append(
+            UserEventHistory(
+                item_id=mapped_item_id,
+                bucket_id=bucket_id,
+                count=count,
+            )
+        )
+
+    return tuple(parsed_histories)
 
 
 def _try_parse_float(value: str) -> float | None:
@@ -384,6 +511,27 @@ def load_item_embedding_resources(dataset_path: str | Path | None = None) -> Ite
         non_numeric_properties_by_item=non_numeric_properties_by_item,
     )
 
+    user_events_path = dataset_dir / "user_events.csv"
+    user_histories_by_visitor: dict[int, dict[str, tuple[UserEventHistory, ...]]] = {}
+    with user_events_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            visitor_id = int(row["visitorid"])
+            user_histories_by_visitor[visitor_id] = {
+                "view": _parse_user_event_history(
+                    str(row["by_user_view_events_lists"]),
+                    item_id_by_original_id,
+                ),
+                "cart": _parse_user_event_history(
+                    str(row["by_user_cart_events_lists"]),
+                    item_id_by_original_id,
+                ),
+                "transaction": _parse_user_event_history(
+                    str(row["by_user_transaction_events_lists"]),
+                    item_id_by_original_id,
+                ),
+            }
+
     return ItemEmbeddingResources(
         numeric_properties_by_item={
             item_id: tuple(records) for item_id, records in numeric_properties_by_item.items()
@@ -395,6 +543,7 @@ def load_item_embedding_resources(dataset_path: str | Path | None = None) -> Ite
         category_properties_by_item={
             item_id: tuple(records) for item_id, records in category_properties_by_item.items()
         },
+        user_histories_by_visitor=user_histories_by_visitor,
         numeric_vector_size=max_numeric_property_id + 2,
         category_vector_size=category_row_count + 1,
         category_ancestors_by_id=category_ancestors_by_id,
@@ -413,7 +562,6 @@ def _build_token_transformer(
     resources: ItemEmbeddingResources,
     d_model: int,
     nhead: int,
-    dim_feedforward: int,
     dropout: float,
     max_len: int,
     device: str | torch.device,
@@ -422,163 +570,49 @@ def _build_token_transformer(
         vocab_size=max(resources.token_to_id.values()) + 1,
         d_model=d_model,
         nhead=nhead,
-        dim_feedforward=dim_feedforward,
         dropout=dropout,
         max_len=max_len,
     )
     return transformer.to(torch.device(device))
 
 
-def _precompute_non_numeric_token_embeddings(
+def _encode_non_numeric_token_sequences(
+    token_strings: list[str],
     resources: ItemEmbeddingResources,
     token_transformer: DecoderOnlyPropertyTransformer,
-    dataset_dir: Path,
-    device: str | torch.device,
-    batch_size: int = 256,
-    load_if_exists: bool = True,
-    save_if_built: bool = True,
-    track_gradients: bool = False,
+    device: torch.device,
 ) -> Tensor:
-    if batch_size <= 0:
-        raise ValueError("batch_size must be greater than 0.")
-    if track_gradients and load_if_exists:
-        raise ValueError("track_gradients=True cannot be combined with load_if_exists=True.")
-    if track_gradients and save_if_built:
-        raise ValueError("track_gradients=True cannot be combined with save_if_built=True.")
+    if not token_strings:
+        return torch.zeros((0, token_transformer.d_model), dtype=torch.float32, device=device)
 
-    resolved_device = torch.device(device)
-    destination = dataset_dir / f"item_property_bucket_token_embeddings_d{token_transformer.d_model}.pt"
-    expected_pair_count = len(resources.non_numeric_item_property_index_by_key)
+    token_id_sequences = [
+        [resources.token_to_id.get(token, UNKNOWN_TOKEN_ID) for token in token_string.split() if token]
+        for token_string in token_strings
+    ]
+    token_id_sequences = [token_ids for token_ids in token_id_sequences if token_ids]
+    if not token_id_sequences:
+        return torch.zeros((0, token_transformer.d_model), dtype=torch.float32, device=device)
 
-    if load_if_exists and destination.exists():
-        cached_embeddings = torch.load(destination, map_location=resolved_device)
-        if (
-            cached_embeddings.ndim == 3
-            and cached_embeddings.shape[0] == expected_pair_count
-            and cached_embeddings.shape[1] == 6
-            and cached_embeddings.shape[2] == token_transformer.d_model
-        ):
-            return cached_embeddings.to(resolved_device)
-
-    item_property_records = sorted(
-        (
-            item_id,
-            record.property_id,
-            record,
-            resources.non_numeric_item_property_index_by_key[(item_id, record.property_id)],
-        )
-        for item_id, records in resources.non_numeric_properties_by_item.items()
-        for record in records
+    max_sequence_length = max(len(token_ids) for token_ids in token_id_sequences)
+    padded_token_ids = torch.full(
+        (len(token_id_sequences), max_sequence_length),
+        PAD_TOKEN_ID,
+        dtype=torch.long,
+        device=device,
     )
-
-    token_transformer = token_transformer.to(resolved_device)
-    was_training = token_transformer.training
-    if not track_gradients:
-        token_transformer.eval()
-    batch_embedding_chunks: list[Tensor] = []
-    progress_bar = tqdm(
-        range(0, len(item_property_records), batch_size),
-        total=math.ceil(len(item_property_records) / batch_size) if item_property_records else 0,
-        desc="Precomputing non-numeric token embeddings",
-        unit="batch",
-    )
-    try:
-        for batch_start in progress_bar:
-            batch_records = item_property_records[batch_start : batch_start + batch_size]
-            sequence_entries: list[tuple[int, int, list[int]]] = []
-            max_sequence_length = 0
-
-            for _, _, record, mapped_index in batch_records:
-                for bucket_id in range(6):
-                    token_string = record.tokens_by_bucket.get(bucket_id, "")
-                    token_ids = [
-                        resources.token_to_id.get(token, UNKNOWN_TOKEN_ID)
-                        for token in token_string.split()
-                        if token
-                    ]
-                    if not token_ids:
-                        continue
-                    sequence_entries.append((mapped_index, bucket_id, token_ids))
-                    max_sequence_length = max(max_sequence_length, len(token_ids))
-
-            if not sequence_entries:
-                batch_embeddings = torch.zeros(
-                    (len(batch_records), 6, token_transformer.d_model),
-                    dtype=torch.float32,
-                    device=resolved_device,
-                )
-                batch_embedding_chunks.append(batch_embeddings)
-                continue
-
-            padded_token_ids = torch.full(
-                (len(sequence_entries), max_sequence_length),
-                PAD_TOKEN_ID,
-                dtype=torch.long,
-                device=resolved_device,
-            )
-            for sequence_index, (_, _, token_ids) in enumerate(sequence_entries):
-                padded_token_ids[sequence_index, : len(token_ids)] = torch.tensor(
-                    token_ids,
-                    dtype=torch.long,
-                    device=resolved_device,
-                )
-
-            if track_gradients:
-                latent_embeddings = token_transformer.get_next_token_latent_embedding(padded_token_ids)
-            else:
-                with torch.no_grad():
-                    latent_embeddings = token_transformer.get_next_token_latent_embedding(padded_token_ids)
-
-            latent_embedding_by_key_bucket = {
-                (mapped_index, bucket_id): latent_embeddings[sequence_index]
-                for sequence_index, (mapped_index, bucket_id, _) in enumerate(sequence_entries)
-            }
-            batch_row_embeddings: list[Tensor] = []
-            for _, _, _, mapped_index in batch_records:
-                bucket_embeddings: list[Tensor] = []
-                for bucket_id in range(6):
-                    bucket_embeddings.append(
-                        latent_embedding_by_key_bucket.get(
-                            (mapped_index, bucket_id),
-                            torch.zeros(
-                                token_transformer.d_model,
-                                dtype=torch.float32,
-                                device=resolved_device,
-                            ),
-                        )
-                    )
-                batch_row_embeddings.append(torch.stack(bucket_embeddings, dim=0))
-            batch_embedding_chunks.append(torch.stack(batch_row_embeddings, dim=0))
-    finally:
-        progress_bar.close()
-        token_transformer.train(was_training)
-    if batch_embedding_chunks:
-        precomputed_embeddings = torch.cat(batch_embedding_chunks, dim=0)
-    else:
-        precomputed_embeddings = torch.zeros(
-            (expected_pair_count, 6, token_transformer.d_model),
-            dtype=torch.float32,
-            device=resolved_device,
-        )
-    if save_if_built:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(precomputed_embeddings.detach().cpu(), destination)
-    return precomputed_embeddings
+    for sequence_index, token_ids in enumerate(token_id_sequences):
+        padded_token_ids[sequence_index, -len(token_ids) :] = padded_token_ids.new_tensor(token_ids)
+    return token_transformer.get_next_token_latent_embedding(padded_token_ids)
 
 
 def initialize_item_embedding_resources(
     dataset_path: str | Path | None = None,
-    transformer_d_model: int = 32,
-    transformer_nhead: int = 4,
-    transformer_dim_feedforward: int = 64,
+    transformer_d_model: int = 16,
+    transformer_nhead: int = 2,
     transformer_dropout: float = 0.0,
-    transformer_max_len: int = 128,
-    item_embedding_size: int = 256,
+    transformer_max_len: int = 32,
+    item_embedding_size: int = 64,
     device: str | torch.device | None = None,
-    non_numeric_token_batch_size: int = 256,
-    load_precomputed_non_numeric_if_exists: bool = True,
-    save_precomputed_non_numeric_if_built: bool = True,
-    track_non_numeric_token_gradients: bool = False,
 ) -> ItemEmbeddingModelState:
     # Loads all CSV-backed resources once, writes item_id_map.csv, and initializes
     # the shared token transformer for the mapped zero-based model item IDs.
@@ -590,20 +624,9 @@ def initialize_item_embedding_resources(
         resources=resources,
         d_model=transformer_d_model,
         nhead=transformer_nhead,
-        dim_feedforward=transformer_dim_feedforward,
         dropout=transformer_dropout,
         max_len=transformer_max_len,
         device=resolved_device,
-    )
-    precomputed_non_numeric_token_embeddings = _precompute_non_numeric_token_embeddings(
-        resources=resources,
-        token_transformer=token_transformer,
-        dataset_dir=_resolve_dataset_dir(dataset_path),
-        device=resolved_device,
-        batch_size=non_numeric_token_batch_size,
-        load_if_exists=load_precomputed_non_numeric_if_exists,
-        save_if_built=save_precomputed_non_numeric_if_built,
-        track_gradients=track_non_numeric_token_gradients,
     )
     bucket_embedding_dim = (
         resources.numeric_vector_size
@@ -612,11 +635,12 @@ def initialize_item_embedding_resources(
         + resources.category_vector_size
     )
     item_projection = nn.Linear(bucket_embedding_dim * 6, item_embedding_size).to(resolved_device)
+    user_projection = nn.Linear(bucket_embedding_dim * 6 * 3, item_embedding_size).to(resolved_device)
     return ItemEmbeddingModelState(
         resources=resources,
         token_transformer=token_transformer,
         item_projection=item_projection,
-        precomputed_non_numeric_token_embeddings=precomputed_non_numeric_token_embeddings,
+        user_projection=user_projection,
         device=resolved_device,
     )
 
@@ -641,31 +665,26 @@ def _build_non_numeric_item_token_embedding(
     item_id: int,
     bucket_id: int,
     resources: ItemEmbeddingResources,
-    precomputed_non_numeric_token_embeddings: Tensor,
+    token_transformer: DecoderOnlyPropertyTransformer,
     device: torch.device,
 ) -> Tensor:
-    # Output shape: [d_model]. Each item-property pair uses a precomputed
-    # [6, d_model] cache indexed by mapped item-property key and bucket.
-    property_embeddings: list[Tensor] = []
+    # Output shape: [d_model]. Each non-empty property token sequence for the
+    # current item bucket is encoded on demand and then averaged.
+    token_strings: list[str] = []
     for record in resources.non_numeric_properties_by_item.get(item_id, ()):
-        if not record.tokens_by_bucket.get(bucket_id, "").strip():
-            continue
-        mapped_index = resources.non_numeric_item_property_index_by_key.get((item_id, record.property_id))
-        if mapped_index is None:
-            continue
-        bucket_embedding = precomputed_non_numeric_token_embeddings[mapped_index, bucket_id]
-        if bucket_embedding.device != device:
-            bucket_embedding = bucket_embedding.to(device)
-        property_embeddings.append(bucket_embedding)
+        token_string = record.tokens_by_bucket.get(bucket_id, "").strip()
+        if token_string:
+            token_strings.append(token_string)
 
-    if not property_embeddings:
-        return torch.zeros(
-            precomputed_non_numeric_token_embeddings.shape[-1],
-            dtype=torch.float32,
-            device=device,
-        )
-
-    return torch.stack(property_embeddings, dim=0).mean(dim=0)
+    latent_embeddings = _encode_non_numeric_token_sequences(
+        token_strings=token_strings,
+        resources=resources,
+        token_transformer=token_transformer,
+        device=device,
+    )
+    if latent_embeddings.numel() == 0:
+        return torch.zeros(token_transformer.d_model, dtype=torch.float32, device=device)
+    return latent_embeddings.mean(dim=0)
 
 
 def _build_non_numeric_item_value_vector(
@@ -730,7 +749,7 @@ def get_item_embedding_by_item_bucket(
     item_id: int,
     bucket_id: int,
     resources: ItemEmbeddingResources,
-    precomputed_non_numeric_token_embeddings: Tensor,
+    token_transformer: DecoderOnlyPropertyTransformer,
     device: str | torch.device,
     timings: dict[str, float] | None = None,
 ) -> Tensor:
@@ -752,7 +771,7 @@ def get_item_embedding_by_item_bucket(
         item_id=item_id,
         bucket_id=bucket_id,
         resources=resources,
-        precomputed_non_numeric_token_embeddings=precomputed_non_numeric_token_embeddings,
+        token_transformer=token_transformer,
         device=resolved_device,
     )
     if timings is not None:
@@ -792,7 +811,7 @@ def get_item_embedding_by_item_bucket(
 def get_item_embedding(
     item_id: int,
     resources: ItemEmbeddingResources,
-    precomputed_non_numeric_token_embeddings: Tensor,
+    token_transformer: DecoderOnlyPropertyTransformer,
     item_projection: nn.Linear,
     device: str | torch.device,
     return_timings: bool = False,
@@ -815,7 +834,7 @@ def get_item_embedding(
             item_id=item_id,
             bucket_id=bucket_id,
             resources=resources,
-            precomputed_non_numeric_token_embeddings=precomputed_non_numeric_token_embeddings,
+            token_transformer=token_transformer,
             device=device,
             timings=timings,
         )
@@ -833,128 +852,76 @@ def get_item_embedding(
     return item_embedding
 
 
-def get_all_items_embedding(
-    dataset_path: str | Path | None = None,
-    item_embedding_size: int = 256,
-    output_path: str | Path | None = None,
-    load_if_exists: bool = True,
-    transformer_d_model: int = 8,
-    transformer_nhead: int = 2,
-    transformer_dim_feedforward: int = 64,
-    transformer_dropout: float = 0.0,
-    transformer_max_len: int = 128,
-    device: str | torch.device | None = None,
-    non_numeric_token_batch_size: int = 256,
-    progress_log_interval: int = 100,
-    use_cached_non_numeric_token_embeddings: bool | None = None,
+def _build_event_type_bucket_embeddings(
+    visitor_id: int,
+    event_type: str,
+    resources: ItemEmbeddingResources,
+    token_transformer: DecoderOnlyPropertyTransformer,
+    device: torch.device,
 ) -> Tensor:
-    # Output shape: [num_of_items, item_embedding_size]. This first tries to load
-    # a saved tensor from disk. If it does not exist, it initializes resources and
-    # shared modules once, then builds the table from get_item_embedding(...).
-    dataset_dir = _resolve_dataset_dir(dataset_path)
-    destination = (
-        Path(output_path).expanduser().resolve()
-        if output_path is not None
-        else dataset_dir / f"all_item_embeddings_{item_embedding_size}.pt"
+    bucket_embedding_dim = (
+        resources.numeric_vector_size
+        + token_transformer.d_model
+        + 3
+        + resources.category_vector_size
     )
-    resolved_device = torch.device(
-        device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    bucket_embeddings = torch.zeros((6, bucket_embedding_dim), dtype=torch.float32, device=device)
+    bucket_counts = torch.zeros(6, dtype=torch.float32, device=device)
 
-    if load_if_exists and destination.exists():
-        return torch.load(destination, map_location=resolved_device)
-
-    if progress_log_interval <= 0:
-        raise ValueError("progress_log_interval must be greater than 0.")
-    resolved_use_cached_non_numeric_token_embeddings = (
-        not torch.is_grad_enabled()
-        if use_cached_non_numeric_token_embeddings is None
-        else use_cached_non_numeric_token_embeddings
-    )
-
-    state = initialize_item_embedding_resources(
-        dataset_path=dataset_dir,
-        transformer_d_model=transformer_d_model,
-        transformer_nhead=transformer_nhead,
-        transformer_dim_feedforward=transformer_dim_feedforward,
-        transformer_dropout=transformer_dropout,
-        transformer_max_len=transformer_max_len,
-        item_embedding_size=item_embedding_size,
-        device=resolved_device,
-        non_numeric_token_batch_size=non_numeric_token_batch_size,
-        load_precomputed_non_numeric_if_exists=resolved_use_cached_non_numeric_token_embeddings,
-        save_precomputed_non_numeric_if_built=resolved_use_cached_non_numeric_token_embeddings,
-        track_non_numeric_token_gradients=not resolved_use_cached_non_numeric_token_embeddings,
-    )
-    print("initialize_item_embedding_resources done", flush=True)
-    item_embeddings: list[Tensor] = []
-    timing_totals = {
-        "numeric": 0.0,
-        "non_numeric_token": 0.0,
-        "non_numeric_value": 0.0,
-        "category": 0.0,
-        "projection": 0.0,
-        "total": 0.0,
-    }
-    progress_bar = tqdm(
-        range(state.resources.item_count),
-        total=state.resources.item_count,
-        desc="Building item embeddings",
-        unit="item",
-        miniters=progress_log_interval,
-    )
-    for processed_count, item_id in enumerate(progress_bar, start=1):
-        item_embedding, item_timings = get_item_embedding(
-            item_id=item_id,
-            resources=state.resources,
-            precomputed_non_numeric_token_embeddings=state.precomputed_non_numeric_token_embeddings,
-            item_projection=state.item_projection,
-            device=state.device,
-            return_timings=True,
+    visitor_histories = resources.user_histories_by_visitor.get(visitor_id, {})
+    for history in visitor_histories.get(event_type, ()):
+        item_bucket_embedding = get_item_embedding_by_item_bucket(
+            item_id=history.item_id,
+            bucket_id=history.bucket_id,
+            resources=resources,
+            token_transformer=token_transformer,
+            device=device,
         )
-        item_embeddings.append(item_embedding)
-        for timing_name, timing_value in item_timings.items():
-            timing_totals[timing_name] += timing_value
-        if (
-            processed_count % progress_log_interval == 0
-            or processed_count == state.resources.item_count
-        ):
-            tqdm.write(
-                "item "
-                f"{item_id}: "
-                f"numeric={item_timings['numeric'] * 1000:.2f}ms, "
-                f"token={item_timings['non_numeric_token'] * 1000:.2f}ms, "
-                f"value={item_timings['non_numeric_value'] * 1000:.2f}ms, "
-                f"category={item_timings['category'] * 1000:.2f}ms, "
-                f"projection={item_timings['projection'] * 1000:.2f}ms, "
-                f"total={item_timings['total'] * 1000:.2f}ms"
-            )
-            progress_bar.set_postfix(
-                {
-                    "avg_num_ms": f"{timing_totals['numeric'] * 1000 / processed_count:.2f}",
-                    "avg_tok_ms": f"{timing_totals['non_numeric_token'] * 1000 / processed_count:.2f}",
-                    "avg_val_ms": f"{timing_totals['non_numeric_value'] * 1000 / processed_count:.2f}",
-                    "avg_cat_ms": f"{timing_totals['category'] * 1000 / processed_count:.2f}",
-                    "avg_proj_ms": f"{timing_totals['projection'] * 1000 / processed_count:.2f}",
-                    "avg_total_ms": f"{timing_totals['total'] * 1000 / processed_count:.2f}",
-                },
-                refresh=False,
-            )
-    progress_bar.close()
-    all_item_embeddings = torch.stack(item_embeddings, dim=0)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(all_item_embeddings, destination)
-    return all_item_embeddings
+        bucket_embeddings[history.bucket_id] += item_bucket_embedding * float(history.count)
+        bucket_counts[history.bucket_id] += float(history.count)
+
+    non_empty_mask = bucket_counts > 0
+    if non_empty_mask.any():
+        bucket_embeddings[non_empty_mask] = (
+            bucket_embeddings[non_empty_mask] / bucket_counts[non_empty_mask].unsqueeze(1)
+        )
+    return bucket_embeddings
 
 
+def get_user_embedding(
+    visitor_id: int,
+    resources: ItemEmbeddingResources,
+    token_transformer: DecoderOnlyPropertyTransformer,
+    user_projection: nn.Linear,
+    device: str | torch.device,
+) -> Tensor:
+    # Final output shape:
+    # [item_embedding_size]. For each of view/cart/transaction, this averages
+    # per-bucket item-bucket embeddings over the visitor's events, concatenates
+    # the 6 bucket vectors, then projects the 18-bucket history down.
+    resolved_device = torch.device(device)
+    event_bucket_embeddings = [
+        _build_event_type_bucket_embeddings(
+            visitor_id=visitor_id,
+            event_type=event_type,
+            resources=resources,
+            token_transformer=token_transformer,
+            device=resolved_device,
+        )
+        for event_type in ("view", "cart", "transaction")
+    ]
+    concatenated_event_history = torch.cat(event_bucket_embeddings, dim=0).reshape(-1)
+    user_projection = user_projection.to(resolved_device)
+    return user_projection(concatenated_event_history)
 __all__ = [
+    "FactorizationMachines",
     "DecoderOnlyPropertyTransformer",
     "ItemEmbeddingModelState",
     "PositionalEncoding",
     "initialize_item_embedding_resources",
     "ItemEmbeddingResources",
-    "get_all_items_embedding",
     "get_item_embedding",
     "get_item_embedding_by_item_bucket",
+    "get_user_embedding",
     "load_item_embedding_resources",
 ]

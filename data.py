@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import csv
 import math
+import random
+import time
 from collections import Counter
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import torch
+from torch import Tensor
+from torch.utils.data import IterableDataset, get_worker_info
 from tqdm import tqdm
 
 def download_kaggle_dataset(
@@ -289,11 +294,11 @@ def _event_timestamp_to_bucket_idx(timestamp_ms: int, cutoff_timestamp_ms: int) 
 
 def merge_events_by_visitor_item(
     dataset_path: str | Path,
-    output_filename: str = "events_merged.csv",
+    output_filename: str = "user_item.csv",
     user_output_filename: str = "user_events.csv",
     cutoff_date: str | None = None,
 ) -> dict[str, Path | int | str]:
-    """Write per-item and per-user bucket summaries split by action type."""
+    """Write user-item labels and visitor-level event summaries."""
 
     events_path = resolve_dataset_file_path(dataset_path, "events.csv")
     output_path = events_path.with_name(output_filename)
@@ -315,11 +320,6 @@ def merge_events_by_visitor_item(
         "view": 0,
         "addtocart": 1,
         "transaction": 2,
-    }
-    action_column_names = {
-        0: "by_user_item_view_event_list_str",
-        1: "by_user_item_cart_event_list_str",
-        2: "by_user_item_transaction_event_list_str",
     }
     user_action_column_names = {
         0: "by_user_view_events_lists",
@@ -373,13 +373,6 @@ def merge_events_by_visitor_item(
             bucket_idx = _event_timestamp_to_bucket_idx(timestamp, cutoff_timestamp)
             item_bucket_counts_by_action[event_id][bucket_idx] += 1
 
-        by_user_item_event_lists = {
-            event_id: "+".join(
-                f"{bucket_idx}|{count}"
-                for bucket_idx, count in sorted(item_bucket_counts_by_action[event_id].items())
-            )
-            for event_id in action_column_names
-        }
         is_cold_start_item = item_cold_start_labels.get(item_id, 0)
         available = item_available_values.get(item_id, "")
 
@@ -390,10 +383,6 @@ def merge_events_by_visitor_item(
                 "available": available,
                 "label": label,
                 "is_cold_start_item": is_cold_start_item,
-                **{
-                    column_name: by_user_item_event_lists[event_id]
-                    for event_id, column_name in action_column_names.items()
-                },
             }
         )
         visitor_action_counters = visitor_event_counts.setdefault(
@@ -439,9 +428,6 @@ def merge_events_by_visitor_item(
                 "visitorid",
                 "itemid",
                 "available",
-                "by_user_item_view_event_list_str",
-                "by_user_item_cart_event_list_str",
-                "by_user_item_transaction_event_list_str",
                 "label",
                 "is_cold_start_item",
             ],
@@ -454,9 +440,6 @@ def merge_events_by_visitor_item(
                     "visitorid": row["visitorid"],
                     "itemid": row["itemid"],
                     "available": row["available"],
-                    "by_user_item_view_event_list_str": row["by_user_item_view_event_list_str"],
-                    "by_user_item_cart_event_list_str": row["by_user_item_cart_event_list_str"],
-                    "by_user_item_transaction_event_list_str": row["by_user_item_transaction_event_list_str"],
                     "label": row["label"],
                     "is_cold_start_item": row["is_cold_start_item"],
                 }
@@ -488,14 +471,16 @@ def merge_events_by_visitor_item(
             )
 
     return {
-        "events_merged_path": output_path,
+        "user_item_path": output_path,
         "user_events_path": user_output_path,
-        "events_merged_row_count": merged_row_count,
+        "user_item_row_count": merged_row_count,
         "negative_data_count": negative_data_count,
         "positive_data_count": positive_data_count,
         "negative_cold_start_data_count": negative_cold_start_data_count,
         "positive_cold_start_data_count": positive_cold_start_data_count,
         "cutoff_date": cutoff_date,
+        "events_merged_path": output_path,
+        "events_merged_row_count": merged_row_count,
     }
 
 
@@ -1352,7 +1337,7 @@ def preprocess_retailrocket_data(dataset_path: str | Path) -> dict[str, Path | d
     )
     print(
         "Finished merge_events_by_visitor_item -> "
-        f'{merged_events_outputs["events_merged_path"]} and '
+        f'{merged_events_outputs["user_item_path"]} and '
         f'{merged_events_outputs["user_events_path"]} '
         f'(negative={merged_events_outputs["negative_data_count"]:,}, '
         f'positive={merged_events_outputs["positive_data_count"]:,}, '
@@ -1373,7 +1358,7 @@ def preprocess_retailrocket_data(dataset_path: str | Path) -> dict[str, Path | d
 
     return {
         "events_time_range_path": events_time_range_outputs["events_time_range_path"],
-        "events_merged_path": merged_events_outputs["events_merged_path"],
+        "user_item_path": merged_events_outputs["user_item_path"],
         "user_events_path": merged_events_outputs["user_events_path"],
         "category_lookup_path": category_lookup_path,
         "leaf_depth_statistics": leaf_depth_statistics,
@@ -1386,11 +1371,305 @@ def preprocess_retailrocket_data(dataset_path: str | Path) -> dict[str, Path | d
         "numeric_properties_bucket_idx_path": bucket_index_property_outputs["numeric_properties_bucket_idx_path"],
         "cate_properties_bucket_idx_path": bucket_index_property_outputs["cate_properties_bucket_idx_path"],
         "non_numeric_properties_bucket_idx_path": bucket_index_property_outputs["non_numeric_properties_bucket_idx_path"],
+        "events_merged_path": merged_events_outputs["events_merged_path"],
     }
+
+
+class UserItemEmbeddingIterableDataset(IterableDataset[tuple[Tensor, Tensor, Tensor]]):
+    """Iterable dataset that samples user-item rows for training."""
+
+    @classmethod
+    def _from_rows(
+        cls,
+        *,
+        user_item_path: Path,
+        resources,
+        token_transformer,
+        item_projection,
+        user_projection,
+        device: torch.device,
+        positive_negative_ratio: tuple[float, float] | None,
+        samples_per_epoch: int | None,
+        shuffle: bool,
+        available_filter: int | str | None,
+        is_cold_start_item_filter: int | str | None,
+        positive_rows: tuple[tuple[int, int, int], ...],
+        negative_rows: tuple[tuple[int, int, int], ...],
+    ) -> "UserItemEmbeddingIterableDataset":
+        dataset = cls.__new__(cls)
+        super(UserItemEmbeddingIterableDataset, dataset).__init__()
+        dataset.user_item_path = user_item_path
+        dataset.resources = resources
+        dataset.token_transformer = token_transformer
+        dataset.item_projection = item_projection
+        dataset.user_projection = user_projection
+        dataset.device = torch.device(device)
+        dataset.shuffle = shuffle
+        dataset.positive_negative_ratio = positive_negative_ratio
+        dataset.available_filter = None if available_filter is None else str(available_filter)
+        dataset.is_cold_start_item_filter = (
+            None if is_cold_start_item_filter is None else str(is_cold_start_item_filter)
+        )
+        dataset.positive_rows = positive_rows
+        dataset.negative_rows = negative_rows
+        dataset.all_rows = positive_rows + negative_rows
+        if positive_negative_ratio is None:
+            dataset.positive_sample_probability = None
+        else:
+            ratio_total = positive_negative_ratio[0] + positive_negative_ratio[1]
+            dataset.positive_sample_probability = float(positive_negative_ratio[0] / ratio_total)
+        dataset.samples_per_epoch = (
+            len(dataset.all_rows)
+            if samples_per_epoch is None
+            else samples_per_epoch
+        )
+        if dataset.samples_per_epoch <= 0:
+            raise ValueError("samples_per_epoch must be greater than 0.")
+        if positive_negative_ratio is not None:
+            if positive_negative_ratio[0] > 0 and not positive_rows:
+                raise ValueError("No positive rows are available for the requested sampling ratio.")
+            if positive_negative_ratio[1] > 0 and not negative_rows:
+                raise ValueError("No negative rows are available for the requested sampling ratio.")
+        elif dataset.samples_per_epoch > len(dataset.all_rows):
+            raise ValueError(
+                "samples_per_epoch cannot exceed the number of rows when positive_negative_ratio is None."
+            )
+        return dataset
+
+    def __init__(
+        self,
+        user_item_path: str | Path,
+        resources,
+        token_transformer,
+        item_projection,
+        user_projection,
+        device: str | torch.device,
+        positive_negative_ratio: float | tuple[int | float, int | float] = 1.0,
+        samples_per_epoch: int | None = None,
+        shuffle: bool = True,
+        available_filter: int | str | None = None,
+        is_cold_start_item_filter: int | str | None = None,
+    ) -> None:
+        super().__init__()
+        self.user_item_path = Path(user_item_path).expanduser().resolve()
+        self.resources = resources
+        self.token_transformer = token_transformer
+        self.item_projection = item_projection
+        self.user_projection = user_projection
+        self.device = torch.device(device)
+        self.shuffle = shuffle
+        self.available_filter = None if available_filter is None else str(available_filter)
+        self.is_cold_start_item_filter = (
+            None if is_cold_start_item_filter is None else str(is_cold_start_item_filter)
+        )
+
+        if isinstance(positive_negative_ratio, tuple):
+            positive_ratio, negative_ratio = positive_negative_ratio
+        else:
+            positive_ratio, negative_ratio = float(positive_negative_ratio), 1.0
+
+        if positive_ratio < 0 or negative_ratio < 0:
+            raise ValueError("positive_negative_ratio values must be non-negative.")
+        if positive_ratio == 0 and negative_ratio == 0:
+            raise ValueError("positive_negative_ratio cannot be (0, 0).")
+        normalized_ratio = (float(positive_ratio), float(negative_ratio))
+
+        positive_rows: list[tuple[int, int, int]] = []
+        negative_rows: list[tuple[int, int, int]] = []
+        with self.user_item_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            required_columns = {"visitorid", "itemid", "label"}
+            missing_columns = required_columns.difference(reader.fieldnames or [])
+            if missing_columns:
+                missing_columns_str = ", ".join(sorted(missing_columns))
+                raise ValueError(
+                    f"{self.user_item_path} is missing required columns: {missing_columns_str}."
+                )
+            for row in reader:
+                if (
+                    self.available_filter is not None
+                    and str(row.get("available", "")) != self.available_filter
+                ):
+                    continue
+                if (
+                    self.is_cold_start_item_filter is not None
+                    and str(row.get("is_cold_start_item", "")) != self.is_cold_start_item_filter
+                ):
+                    continue
+                label = int(row["label"])
+                item_id = self.resources.item_id_by_original_id.get(int(row["itemid"]))
+                if item_id is None:
+                    continue
+                sample = (int(row["visitorid"]), item_id, label)
+                if label == 1:
+                    positive_rows.append(sample)
+                elif label == 0:
+                    negative_rows.append(sample)
+                else:
+                    raise ValueError(f"Unsupported label value {label!r} in {self.user_item_path}.")
+
+        if positive_ratio > 0 and not positive_rows:
+            raise ValueError("No positive rows are available for the requested sampling ratio.")
+        if negative_ratio > 0 and not negative_rows:
+            raise ValueError("No negative rows are available for the requested sampling ratio.")
+
+        self.positive_negative_ratio = normalized_ratio
+        self.positive_rows = tuple(positive_rows)
+        self.negative_rows = tuple(negative_rows)
+        self.all_rows = self.positive_rows + self.negative_rows
+        ratio_total = normalized_ratio[0] + normalized_ratio[1]
+        self.positive_sample_probability = float(normalized_ratio[0] / ratio_total)
+        self.samples_per_epoch = (
+            len(self.positive_rows) + len(self.negative_rows)
+            if samples_per_epoch is None
+            else samples_per_epoch
+        )
+        if self.samples_per_epoch <= 0:
+            raise ValueError("samples_per_epoch must be greater than 0.")
+
+    def __len__(self) -> int:
+        return self.samples_per_epoch
+
+    def _sample_row(
+        self,
+        rows: tuple[tuple[int, int, int], ...],
+        rng: random.Random,
+    ) -> tuple[int, int, int]:
+        if not rows:
+            raise ValueError("Cannot sample from an empty row pool.")
+        return rows[rng.randrange(len(rows))]
+
+    def _build_sample(
+        self,
+        visitor_id: int,
+        item_id: int,
+        label: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        from model import get_item_embedding, get_user_embedding
+
+        user_embedding = get_user_embedding(
+            visitor_id=visitor_id,
+            resources=self.resources,
+            token_transformer=self.token_transformer,
+            user_projection=self.user_projection,
+            device=self.device,
+        )
+        item_embedding = get_item_embedding(
+            item_id=item_id,
+            resources=self.resources,
+            token_transformer=self.token_transformer,
+            item_projection=self.item_projection,
+            device=self.device,
+        )
+        label_tensor = torch.tensor(float(label), dtype=torch.float32, device=self.device)
+        return user_embedding, item_embedding, label_tensor
+
+    def split(
+        self,
+        train_size: float = 0.8,
+        seed: int = 42,
+        train_samples_per_epoch: int | None = None,
+        test_samples_per_epoch: int | None = None,
+    ) -> tuple["UserItemEmbeddingIterableDataset", "UserItemEmbeddingIterableDataset"]:
+        if train_size <= 0 or train_size >= 1:
+            raise ValueError("train_size must be between 0 and 1.")
+
+        rng = random.Random(seed)
+        positive_rows = list(self.positive_rows)
+        negative_rows = list(self.negative_rows)
+        rng.shuffle(positive_rows)
+        rng.shuffle(negative_rows)
+
+        positive_split_index = int(len(positive_rows) * train_size)
+        negative_split_index = int(len(negative_rows) * train_size)
+
+        train_dataset = self._from_rows(
+            user_item_path=self.user_item_path,
+            resources=self.resources,
+            token_transformer=self.token_transformer,
+            item_projection=self.item_projection,
+            user_projection=self.user_projection,
+            device=self.device,
+            positive_negative_ratio=self.positive_negative_ratio,
+            samples_per_epoch=train_samples_per_epoch,
+            shuffle=self.shuffle,
+            available_filter=self.available_filter,
+            is_cold_start_item_filter=self.is_cold_start_item_filter,
+            positive_rows=tuple(positive_rows[:positive_split_index]),
+            negative_rows=tuple(negative_rows[:negative_split_index]),
+        )
+        test_dataset = self._from_rows(
+            user_item_path=self.user_item_path,
+            resources=self.resources,
+            token_transformer=self.token_transformer,
+            item_projection=self.item_projection,
+            user_projection=self.user_projection,
+            device=self.device,
+            positive_negative_ratio=None,
+            samples_per_epoch=test_samples_per_epoch,
+            shuffle=False,
+            available_filter=self.available_filter,
+            is_cold_start_item_filter=self.is_cold_start_item_filter,
+            positive_rows=tuple(positive_rows[positive_split_index:]),
+            negative_rows=tuple(negative_rows[negative_split_index:]),
+        )
+        return train_dataset, test_dataset
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = 0 if worker_info is None else worker_info.id
+        num_workers = 1 if worker_info is None else worker_info.num_workers
+        worker_sample_count = (self.samples_per_epoch + num_workers - 1) // num_workers
+        rng = random.Random(time.time_ns() + worker_id)
+
+        if self.positive_negative_ratio is None:
+            if self.shuffle:
+                row_pool = list(self.all_rows)
+                rng.shuffle(row_pool)
+            else:
+                row_pool = self.all_rows
+
+            for sample_index in range(worker_sample_count):
+                global_index = sample_index * num_workers + worker_id
+                if global_index >= self.samples_per_epoch:
+                    break
+                visitor_id, item_id, label = row_pool[global_index]
+                yield self._build_sample(visitor_id=visitor_id, item_id=item_id, label=label)
+            return
+
+        for sample_index in range(worker_sample_count):
+            global_index = sample_index * num_workers + worker_id
+            if global_index >= self.samples_per_epoch:
+                break
+
+            if self.shuffle:
+                label_to_draw = 1 if rng.random() < self.positive_sample_probability else 0
+            else:
+                cycle_position = global_index / max(self.samples_per_epoch, 1)
+                label_to_draw = 1 if cycle_position < self.positive_sample_probability else 0
+            if label_to_draw == 1:
+                visitor_id, item_id, label = self._sample_row(self.positive_rows, rng)
+            else:
+                visitor_id, item_id, label = self._sample_row(self.negative_rows, rng)
+            yield self._build_sample(visitor_id=visitor_id, item_id=item_id, label=label)
+
+
+def collate_user_item_embedding_batch(
+    batch: list[tuple[Tensor, Tensor, Tensor]],
+) -> tuple[Tensor, Tensor, Tensor]:
+    if not batch:
+        raise ValueError("batch must contain at least one sample.")
+    user_embeddings, item_embeddings, labels = zip(*batch)
+    return (
+        torch.stack(user_embeddings, dim=0),
+        torch.stack(item_embeddings, dim=0),
+        torch.stack(labels, dim=0),
+    )
 
 
 __all__ = [
     "build_category_lookup_rows",
+    "collate_user_item_embedding_batch",
     "compute_leaf_depth_statistics",
     "download_kaggle_dataset",
     "generate_events_time_range",
@@ -1406,5 +1685,6 @@ __all__ = [
     "preprocess_retailrocket_data",
     "resolve_dataset_file_path",
     "resolve_category_tree_path",
+    "UserItemEmbeddingIterableDataset",
     "write_bucket_index_property_files",
 ]

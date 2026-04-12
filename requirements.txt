@@ -1,3 +1,4 @@
 kagglehub>=0.3.10
 tqdm>=4.66.0
 torch>=2.11.0
+wandb>=0.19.0
