@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import csv
+import heapq
 import math
+import multiprocessing
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +16,7 @@ from torch import Tensor, nn
 PAD_TOKEN_ID = 0
 UNKNOWN_TOKEN_ID = 1
 DEFAULT_DATASET_DIR = Path(__file__).resolve().parent / "data"
+DEFAULT_ITEM_BUCKET_EMBEDDING_CACHE_SIZE = 100000
 
 
 @dataclass(frozen=True)
@@ -67,6 +71,89 @@ class ItemEmbeddingModelState:
     item_projection: nn.Linear
     user_projection: nn.Linear
     device: torch.device
+
+
+@dataclass(frozen=True)
+class LoadedModelBundle:
+    token_transformer: "DecoderOnlyPropertyTransformer"
+    item_projection: nn.Linear
+    user_projection: nn.Linear
+    fm_model: "FactorizationMachines"
+    device: torch.device
+    resources: ItemEmbeddingResources | None = None
+
+
+@dataclass
+class _ItemBucketEmbeddingCacheEntry:
+    embedding: Tensor
+    query_count: int
+    version: int
+
+
+class _ItemBucketEmbeddingCache:
+    def __init__(self, max_size: int = DEFAULT_ITEM_BUCKET_EMBEDDING_CACHE_SIZE) -> None:
+        if max_size <= 0:
+            raise ValueError("max_size must be greater than 0.")
+        self.max_size = max_size
+        self._lock = multiprocessing.RLock()
+        self.total_query_count = 0
+        self._entries: dict[tuple[int, int], _ItemBucketEmbeddingCacheEntry] = {}
+        self._min_heap: list[tuple[int, int, tuple[int, int]]] = []
+        self.miss = 0
+        self.hit = 0
+
+    def _life_point(self, query_count: int) -> int:
+        return query_count - self.total_query_count
+
+    def _push_heap_entry(self, key: tuple[int, int]) -> None:
+        entry = self._entries[key]
+        heapq.heappush(self._min_heap, (entry.query_count, entry.version, key))
+
+    def get(self, key: tuple[int, int]) -> Tensor | None:
+        with self._lock:
+            self.total_query_count += 1
+            entry = self._entries.get(key)
+            if entry is None:
+                self.miss += 1
+                return None
+            self.hit += 1
+            entry.query_count += 1
+            entry.version += 1
+            self._push_heap_entry(key)
+            return entry.embedding
+
+    def put(self, key: tuple[int, int], embedding: Tensor) -> None:
+        with self._lock:
+            if key in self._entries:
+                return
+
+            if len(self._entries) >= self.max_size and not self._evict_one_negative_life_point():
+                return
+
+            self._entries[key] = _ItemBucketEmbeddingCacheEntry(
+                embedding=embedding,
+                query_count=0,
+                version=0,
+            )
+            self._push_heap_entry(key)
+
+    def _evict_one_negative_life_point(self) -> bool:
+        while self._min_heap:
+            cached_query_count, cached_version, key = heapq.heappop(self._min_heap)
+            entry = self._entries.get(key)
+            if entry is None:
+                continue
+            if entry.query_count != cached_query_count or entry.version != cached_version:
+                continue
+            if self._life_point(entry.query_count) >= 0:
+                self._push_heap_entry(key)
+                return False
+            del self._entries[key]
+            return True
+        return False
+
+
+_ITEM_BUCKET_EMBEDDING_CACHE = _ItemBucketEmbeddingCache()
 
 
 class PositionalEncoding(nn.Module):
@@ -173,19 +260,24 @@ class FactorizationMachines(nn.Module):
         self,
         embedding_dim: int,
         latent_dim: int = 16,
+        l2_reg_weight: float = 1e-6,
+        dtype=torch.float32
     ) -> None:
         super().__init__()
         if embedding_dim <= 0:
             raise ValueError("embedding_dim must be greater than 0.")
         if latent_dim <= 0:
             raise ValueError("latent_dim must be greater than 0.")
+        if l2_reg_weight < 0:
+            raise ValueError("l2_reg_weight must be non-negative.")
 
         self.embedding_dim = embedding_dim
         self.input_dim = embedding_dim * 2
         self.latent_dim = latent_dim
-        self.linear = nn.Linear(self.input_dim, 1)
+        self.l2_reg_weight = l2_reg_weight
+        self.linear = nn.Linear(self.input_dim, 1, dtype=dtype)
         self.factor_embeddings = nn.Parameter(
-            torch.empty(self.input_dim, latent_dim, dtype=torch.float32)
+            torch.empty(self.input_dim, latent_dim, dtype=dtype)
         )
         self.loss_fn = nn.BCEWithLogitsLoss()
         self.reset_parameters()
@@ -219,6 +311,8 @@ class FactorizationMachines(nn.Module):
             user_embeddings=user_embeddings,
             item_embeddings=item_embeddings,
         )
+        features = torch.nan_to_num(features, nan=0.0, posinf=100.0, neginf=-100.0)
+        features = features.clamp(min=-100.0, max=100.0)
         linear_term = self.linear(features).squeeze(-1)
         projected_features = features @ self.factor_embeddings
         projected_squared = projected_features.square()
@@ -238,21 +332,144 @@ class FactorizationMachines(nn.Module):
         user_embeddings: Tensor,
         item_embeddings: Tensor,
         labels: Tensor,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         logits = self.forward(user_embeddings, item_embeddings)
         labels = labels.to(device=logits.device, dtype=logits.dtype).reshape(-1)
         if labels.shape != logits.shape:
             raise ValueError("labels must have shape [batch_size].")
-        return self.loss_fn(logits, labels)
+        prediction_loss = self.loss_fn(logits, labels)
+        l2_penalty = self.linear.weight.square().sum() + self.factor_embeddings.square().sum()
+        if self.linear.bias is not None:
+            l2_penalty = l2_penalty + self.linear.bias.square().sum()
+        return logits, prediction_loss + self.l2_reg_weight * l2_penalty
 
     def forward_batch(
         self,
         batch: tuple[Tensor, Tensor, Tensor],
     ) -> tuple[Tensor, Tensor]:
         user_embeddings, item_embeddings, labels = batch
-        logits = self.forward(user_embeddings, item_embeddings)
-        loss = self.compute_loss(user_embeddings, item_embeddings, labels)
-        return logits, loss
+        return self.compute_loss(user_embeddings, item_embeddings, labels)
+
+
+def _get_transformer_config(
+    token_transformer: DecoderOnlyPropertyTransformer,
+) -> dict[str, int | float]:
+    return {
+        "vocab_size": token_transformer.token_embedding.num_embeddings,
+        "d_model": token_transformer.d_model,
+        "nhead": token_transformer.attention_layer.self_attn.num_heads,
+        "dropout": float(token_transformer.attention_layer.self_attn.dropout),
+        "max_len": token_transformer.max_len,
+    }
+
+
+def _get_fm_config(fm_model: FactorizationMachines) -> dict[str, int | float]:
+    return {
+        "embedding_dim": fm_model.embedding_dim,
+        "latent_dim": fm_model.latent_dim,
+        "l2_reg_weight": fm_model.l2_reg_weight,
+    }
+
+
+def save_model(
+    path: str | Path,
+    state: ItemEmbeddingModelState,
+    fm_model: FactorizationMachines,
+) -> Path:
+    checkpoint_path = Path(path).expanduser().resolve()
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    checkpoint = {
+        "transformer_config": _get_transformer_config(state.token_transformer),
+        "item_projection_config": {
+            "in_features": state.item_projection.in_features,
+            "out_features": state.item_projection.out_features,
+            "bias": state.item_projection.bias is not None,
+        },
+        "user_projection_config": {
+            "in_features": state.user_projection.in_features,
+            "out_features": state.user_projection.out_features,
+            "bias": state.user_projection.bias is not None,
+        },
+        "fm_config": _get_fm_config(fm_model),
+        "token_transformer_state_dict": state.token_transformer.state_dict(),
+        "item_projection_state_dict": state.item_projection.state_dict(),
+        "user_projection_state_dict": state.user_projection.state_dict(),
+        "fm_state_dict": fm_model.state_dict(),
+    }
+    torch.save(checkpoint, checkpoint_path)
+    return checkpoint_path
+
+
+def load_model(
+    path: str | Path,
+    dataset_path: str | Path | None = None,
+    device: str | torch.device | None = None,
+    load_resources: bool = False,
+) -> LoadedModelBundle:
+    resolved_device = torch.device(
+        device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    checkpoint_path = Path(path).expanduser().resolve()
+    checkpoint = torch.load(checkpoint_path, map_location=resolved_device)
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"Checkpoint at {checkpoint_path} must be a mapping.")
+
+    transformer_config = checkpoint.get("transformer_config")
+    item_projection_config = checkpoint.get("item_projection_config")
+    user_projection_config = checkpoint.get("user_projection_config")
+    fm_config = checkpoint.get("fm_config")
+    if not isinstance(transformer_config, Mapping):
+        raise ValueError("Checkpoint is missing transformer_config.")
+    if not isinstance(item_projection_config, Mapping):
+        raise ValueError("Checkpoint is missing item_projection_config.")
+    if not isinstance(user_projection_config, Mapping):
+        raise ValueError("Checkpoint is missing user_projection_config.")
+    if not isinstance(fm_config, Mapping):
+        raise ValueError("Checkpoint is missing fm_config.")
+
+    token_transformer = DecoderOnlyPropertyTransformer(
+        vocab_size=int(transformer_config["vocab_size"]),
+        d_model=int(transformer_config["d_model"]),
+        nhead=int(transformer_config["nhead"]),
+        dropout=float(transformer_config["dropout"]),
+        max_len=int(transformer_config["max_len"]),
+    ).to(resolved_device)
+    item_projection = nn.Linear(
+        int(item_projection_config["in_features"]),
+        int(item_projection_config["out_features"]),
+        bias=bool(item_projection_config["bias"]),
+    ).to(resolved_device)
+    user_projection = nn.Linear(
+        int(user_projection_config["in_features"]),
+        int(user_projection_config["out_features"]),
+        bias=bool(user_projection_config["bias"]),
+    ).to(resolved_device)
+    fm_model = FactorizationMachines(
+        embedding_dim=int(fm_config["embedding_dim"]),
+        latent_dim=int(fm_config["latent_dim"]),
+        l2_reg_weight=float(fm_config["l2_reg_weight"]),
+    ).to(resolved_device)
+
+    token_transformer.load_state_dict(checkpoint["token_transformer_state_dict"])
+    item_projection.load_state_dict(checkpoint["item_projection_state_dict"])
+    user_projection.load_state_dict(checkpoint["user_projection_state_dict"])
+    fm_model.load_state_dict(checkpoint["fm_state_dict"])
+
+    resources = None
+    if load_resources:
+        if dataset_path is None:
+            raise ValueError("dataset_path must be provided when load_resources=True.")
+        resources = load_item_embedding_resources(dataset_path)
+
+    return LoadedModelBundle(
+        token_transformer=token_transformer,
+        item_projection=item_projection,
+        user_projection=user_projection,
+        fm_model=fm_model,
+        device=resolved_device,
+        resources=resources,
+    )
 
 def _resolve_dataset_dir(dataset_path: str | Path | None = None) -> Path:
     if dataset_path is None:
@@ -337,6 +554,12 @@ def _parse_numeric_values(value: str) -> list[float]:
         if parsed is not None:
             parsed_values.append(parsed)
     return parsed_values
+
+
+def _signed_log1p_tensor(values: Tensor) -> Tensor:
+    """Compress large-magnitude numeric summaries while preserving sign."""
+
+    return values.sign() * torch.log1p(values.abs())
 
 
 def _build_token_vocab(non_numeric_path: Path) -> dict[str, int]:
@@ -636,6 +859,8 @@ def initialize_item_embedding_resources(
     )
     item_projection = nn.Linear(bucket_embedding_dim * 6, item_embedding_size).to(resolved_device)
     user_projection = nn.Linear(bucket_embedding_dim * 6 * 3, item_embedding_size).to(resolved_device)
+    torch.nn.init.xavier_uniform_(item_projection.weight)
+    torch.nn.init.xavier_uniform_(user_projection.weight)
     return ItemEmbeddingModelState(
         resources=resources,
         token_transformer=token_transformer,
@@ -704,21 +929,22 @@ def _build_non_numeric_item_value_vector(
             continue
         property_max_values.append(max(numeric_values))
         property_min_values.append(min(numeric_values))
-        property_mean_values.append(sum(numeric_values) / len(numeric_values))
+        property_mean_values.append(sum(numeric_values) / len(numeric_values) if len(numeric_values) > 0 else 0.0 )
 
     if not property_max_values:
         return torch.zeros(3, dtype=torch.float32, device=device)
 
     # Output order follows the requested per-property summary dimensions: max, min, mean.
-    return torch.tensor(
+    raw_summary = torch.tensor(
         [
             max(property_max_values),
             min(property_min_values),
-            sum(property_mean_values) / len(property_mean_values),
+            sum(property_mean_values) / len(property_mean_values) if len(property_mean_values) > 0 else 0.0,
         ],
         dtype=torch.float32,
         device=device,
     )
+    return _signed_log1p_tensor(raw_summary)
 
 
 def _build_category_item_vector(
@@ -760,6 +986,10 @@ def get_item_embedding_by_item_bucket(
         raise ValueError("bucket_id must be in the range [0, 6].")
 
     resolved_device = torch.device(device)
+    cache_lookup_key = (item_id, bucket_id)
+    cached_embedding = _ITEM_BUCKET_EMBEDDING_CACHE.get(cache_lookup_key)
+    if cached_embedding is not None:
+        return cached_embedding
 
     start_time = time.perf_counter()
     numeric_item_vector = _build_numeric_item_vector(item_id, bucket_id, resources, resolved_device)
@@ -797,7 +1027,7 @@ def get_item_embedding_by_item_bucket(
     if timings is not None:
         timings["category"] += time.perf_counter() - start_time
 
-    return torch.cat(
+    item_bucket_embedding = torch.cat(
         [
             numeric_item_vector,
             non_numeric_item_token_embedding,
@@ -806,6 +1036,8 @@ def get_item_embedding_by_item_bucket(
         ],
         dim=0,
     )
+    _ITEM_BUCKET_EMBEDDING_CACHE.put(cache_lookup_key, item_bucket_embedding.detach())
+    return item_bucket_embedding
 
 
 def get_item_embedding(
@@ -882,8 +1114,9 @@ def _build_event_type_bucket_embeddings(
 
     non_empty_mask = bucket_counts > 0
     if non_empty_mask.any():
-        bucket_embeddings[non_empty_mask] = (
-            bucket_embeddings[non_empty_mask] / bucket_counts[non_empty_mask].unsqueeze(1)
+        bucket_embeddings[non_empty_mask] = torch.nan_to_num (
+            (bucket_embeddings[non_empty_mask] / bucket_counts[non_empty_mask].unsqueeze(1)), 
+            nan=0.0, posinf=100.0, neginf=-100.0
         )
     return bucket_embeddings
 
@@ -917,11 +1150,14 @@ __all__ = [
     "FactorizationMachines",
     "DecoderOnlyPropertyTransformer",
     "ItemEmbeddingModelState",
+    "LoadedModelBundle",
     "PositionalEncoding",
     "initialize_item_embedding_resources",
     "ItemEmbeddingResources",
     "get_item_embedding",
     "get_item_embedding_by_item_bucket",
     "get_user_embedding",
+    "save_model",
+    "load_model",
     "load_item_embedding_resources",
 ]

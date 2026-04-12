@@ -14,12 +14,17 @@ During preprocessing, the raw logs are converted into training-ready tables:
 - `user_item.csv` stores user-item pairs and the prediction label.
 - `user_events.csv` stores each user's historical interactions grouped by event type and time bucket.
 - Bucketed property files store item features across several time windows before the cutoff date.
+- The total time range of the events is 4.5 months. cutoff_date is the first day + 4 months.
+- All events used in the training and testing are before the cutoff_date.
+- Label is 1 if there is at least 1 view event of this user-item pair after cutoff_date, 0 other wise.
+- cold-start is 1 if the item's earliest view event happened in the last 15 days.
+- implicit negative samples are not considered in this experiments.
 
 The preprocessing step also marks whether an item is a cold-start item. In this project, an item is treated as cold start if its first view appears on or after the cutoff date.
 
 ## Model
 
-The model follows a content-based recommendation design. Item embeddings are built directly from item properties, including numeric features, category structure, and tokenized non-numeric attributes. User embeddings are then constructed from the embeddings of items the user has interacted with, separated by event type and recency bucket. A factorization machine is used on top of the final user and item embeddings for binary prediction.
+The model follows a content-based recommendation design. Item embeddings are built directly from item properties, including numeric features, category structure, and tokenized non-numeric attributes. User embeddings are then constructed from the embeddings of items the user has interacted with, separated by event type and recency bucket. A factorization machine (and L2 norm) is used on top of the final user and item embeddings for binary prediction. It is fast so I choose it aa a PoC model.
 
 A content-based approach is a good fit here for several reasons:
 

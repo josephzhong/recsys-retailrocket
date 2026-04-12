@@ -12,6 +12,8 @@ import torch
 from torch import Tensor
 from torch.utils.data import IterableDataset, get_worker_info
 from tqdm import tqdm
+from model import get_item_embedding, get_user_embedding
+
 
 def download_kaggle_dataset(
     dataset_name: str,
@@ -496,9 +498,13 @@ def _parse_single_numeric_property_value(raw_value: str) -> float | None:
         return None
 
     try:
-        return float(token[1:])
+        parsed = float(token[1:])
     except ValueError:
         return None
+
+    if not math.isfinite(parsed):
+        return None
+    return parsed
 
 
 def _split_property_value_tokens(raw_value: str) -> tuple[str, str]:
@@ -963,12 +969,30 @@ def merge_item_properties_files(
         1: 0,
         2: 0,
     }
+    property_observations: dict[str, dict[str, bool]] = {}
 
     for row in merged_rows:
         property_id = row["property"]
-        if property_id in category_property_ids:
+        observation = property_observations.setdefault(
+            property_id,
+            {
+                "is_category": property_id in category_property_ids,
+                "saw_valid_numeric": False,
+                "saw_non_numeric": False,
+            },
+        )
+        if observation["is_category"]:
+            continue
+
+        if _parse_single_numeric_property_value(row["value"]) is not None:
+            observation["saw_valid_numeric"] = True
+        else:
+            observation["saw_non_numeric"] = True
+
+    for property_id, observation in property_observations.items():
+        if observation["is_category"]:
             property_type = property_type_codes["category"]
-        elif _parse_single_numeric_property_value(row["value"]) is not None:
+        elif observation["saw_valid_numeric"] and not observation["saw_non_numeric"]:
             property_type = property_type_codes["numeric"]
         else:
             property_type = property_type_codes["non-numeric"]
@@ -1141,6 +1165,11 @@ def process_numeric_property_values(
                 summary = property_statistics[property_id]
                 values = summary["values"]
                 mean_value, std_value = _compute_mean_std(values)
+                if not math.isfinite(mean_value) or not math.isfinite(std_value):
+                    raise ValueError(
+                        f"Non-finite numeric statistics for property {property_id}: "
+                        f"mean={mean_value}, std={std_value}"
+                    )
                 writer.writerow(
                     [
                         property_id,
@@ -1213,6 +1242,11 @@ def process_numeric_property_values(
         mean_value = float(property_statistics[property_id]["mean_value"])
         std_value = float(property_statistics[property_id]["std_value"])
         normalized_value = 0.0 if std_value == 0.0 else (numeric_value - mean_value) / std_value
+        if not math.isfinite(normalized_value):
+            raise ValueError(
+                f"Non-finite normalized value for property {property_id} on item {row['itemid']}: "
+                f"raw={numeric_value}, mean={mean_value}, std={std_value}"
+            )
 
         normalized_numeric_rows.append(
             {
@@ -1418,6 +1452,7 @@ class UserItemEmbeddingIterableDataset(IterableDataset[tuple[Tensor, Tensor, Ten
         else:
             ratio_total = positive_negative_ratio[0] + positive_negative_ratio[1]
             dataset.positive_sample_probability = float(positive_negative_ratio[0] / ratio_total)
+        dataset.sample_log_time = {"user": 0.0, "item": 0.0, "cnt": 0}
         dataset.samples_per_epoch = (
             len(dataset.all_rows)
             if samples_per_epoch is None
@@ -1524,6 +1559,7 @@ class UserItemEmbeddingIterableDataset(IterableDataset[tuple[Tensor, Tensor, Ten
             if samples_per_epoch is None
             else samples_per_epoch
         )
+        self.sample_log_time = {"user": 0.0, "item": 0.0, "cnt": 0}
         if self.samples_per_epoch <= 0:
             raise ValueError("samples_per_epoch must be greater than 0.")
 
@@ -1545,7 +1581,6 @@ class UserItemEmbeddingIterableDataset(IterableDataset[tuple[Tensor, Tensor, Ten
         item_id: int,
         label: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        from model import get_item_embedding, get_user_embedding
 
         user_embedding = get_user_embedding(
             visitor_id=visitor_id,
