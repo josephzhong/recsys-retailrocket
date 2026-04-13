@@ -1,5 +1,10 @@
 # recsys-retailrocket
 
+<p align="center">
+  <img src="pics/all_test.png" alt="All test results" width="48%" />
+  <img src="pics/cold_start.png" alt="Cold start results" width="48%" />
+</p>
+
 This project builds a recommendation pipeline on top of the Retailrocket dataset, with a focus on learning item and user representations from product content and interaction history. The overall goal is to predict whether a user will view an item after a time cutoff, while keeping the representation simple to compute and practical for cold-start scenarios.
 
 ## Data
