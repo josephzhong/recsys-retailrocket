@@ -1,5 +1,11 @@
 # recsys-retailrocket
 
+[RetailRocket](https://www.kaggle.com/datasets/retailrocket/ecommerce-dataset) is a challenging dataset with rich information of item-side properties. With the help of AI coding tools, I managed to build a recommender system model with good performance on top of it within 2 days.
+
+Highlights:
+- AUC > 0.93 for whole test set and AUC > 0.77 for cold start test set.
+- Optimized data pipeline for trainig time per epoch from 30 hours to 20 minutes.
+
 <p align="center">
   <img src="pics/all_test.png" alt="All test results" width="48%" />
   <img src="pics/cold_start.png" alt="Cold start results" width="48%" />
